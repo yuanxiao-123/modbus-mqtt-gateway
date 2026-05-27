@@ -40,17 +40,27 @@ void log_write(LogLevel level, const char *fmt, ...) {
     printf("\n");
 }
 
+/* ─────────────── 设备列表 ─────────────── */
+#define DEVICE_MAX 8
+
+typedef struct {
+    int  slave_id;
+    int  reg_temp;
+    int  reg_humidity;
+    char topic[128];
+} DeviceConfig;
+
 /* ─────────────── 配置 ─────────────── */
 typedef struct {
     char serial_port[64];
     int  baudrate;
-    int  slave_id;
     int  poll_interval;
     char broker[128];
     char client_id[64];
-    char topic[128];
     int  qos;
     char db_path[64];
+    DeviceConfig devices[DEVICE_MAX];
+    int          device_count;
 } Config;
 
 Config g_cfg;
@@ -66,12 +76,11 @@ void config_load(const char *path) {
     strncpy(g_cfg.serial_port, "/dev/pts/2",           63);
     strncpy(g_cfg.broker,      "tcp://localhost:1883", 127);
     strncpy(g_cfg.client_id,   "modbus_mqtt_gateway",   63);
-    strncpy(g_cfg.topic,       "factory/sensor/01",    127);
     strncpy(g_cfg.db_path,     "gateway.db",            63);
     g_cfg.baudrate      = 9600;
-    g_cfg.slave_id      = 1;
     g_cfg.poll_interval = 1;
     g_cfg.qos           = 1;
+    g_cfg.device_count  = 0;
 
     FILE *f = fopen(path, "r");
     if (!f) {
@@ -80,6 +89,9 @@ void config_load(const char *path) {
     }
 
     char line[256], section[64] = "";
+    static char last_section[64] = "";
+    static int  last_idx = -1;
+
     while (fgets(line, sizeof(line), f)) {
         char *p = trim(line);
         if (*p == '#' || *p == '\0') continue;
@@ -99,19 +111,41 @@ void config_load(const char *path) {
         if (strcmp(section, "serial") == 0) {
             if      (strcmp(key, "port")         == 0) strncpy(g_cfg.serial_port, val, 63);
             else if (strcmp(key, "baudrate")      == 0) g_cfg.baudrate      = atoi(val);
-            else if (strcmp(key, "slave_id")      == 0) g_cfg.slave_id      = atoi(val);
             else if (strcmp(key, "poll_interval") == 0) g_cfg.poll_interval = atoi(val);
         } else if (strcmp(section, "mqtt") == 0) {
             if      (strcmp(key, "broker")    == 0) strncpy(g_cfg.broker,    val, 127);
             else if (strcmp(key, "client_id") == 0) strncpy(g_cfg.client_id, val,  63);
-            else if (strcmp(key, "topic")     == 0) strncpy(g_cfg.topic,     val, 127);
             else if (strcmp(key, "qos")       == 0) g_cfg.qos = atoi(val);
         } else if (strcmp(section, "database") == 0) {
             if (strcmp(key, "path") == 0) strncpy(g_cfg.db_path, val, 63);
+        } else if (strncmp(section, "device_", 7) == 0) {
+            // 新section出现时分配一个新设备槽位
+            if (strcmp(section, last_section) != 0) {
+                strncpy(last_section, section, 63);
+                last_idx = g_cfg.device_count;
+                if (last_idx < DEVICE_MAX) {
+                    g_cfg.device_count++;
+                    g_cfg.devices[last_idx].slave_id     = 1;
+                    g_cfg.devices[last_idx].reg_temp     = 0;
+                    g_cfg.devices[last_idx].reg_humidity = 1;
+                    strncpy(g_cfg.devices[last_idx].topic,
+                            "factory/sensor/unknown", 127);
+                }
+            }
+            if (last_idx >= 0 && last_idx < DEVICE_MAX) {
+                if      (strcmp(key, "slave_id")     == 0)
+                    g_cfg.devices[last_idx].slave_id = atoi(val);
+                else if (strcmp(key, "reg_temp")     == 0)
+                    g_cfg.devices[last_idx].reg_temp = atoi(val);
+                else if (strcmp(key, "reg_humidity") == 0)
+                    g_cfg.devices[last_idx].reg_humidity = atoi(val);
+                else if (strcmp(key, "topic")        == 0)
+                    strncpy(g_cfg.devices[last_idx].topic, val, 127);
+            }
         }
     }
     fclose(f);
-    log_write(LOG_INFO, "[CFG] 配置加载成功: %s", path);
+    log_write(LOG_INFO, "[CFG] 配置加载成功: %s，共%d个设备", path, g_cfg.device_count);
 }
 
 /* ─────────────── 队列 ─────────────── */
@@ -222,28 +256,34 @@ void db_replay(MQTTClient client) {
 /* ─────────────── 采集线程 ─────────────── */
 void *collect_thread(void *arg) {
     modbus_t *ctx = modbus_new_rtu(g_cfg.serial_port, g_cfg.baudrate, 'N', 8, 1);
-    modbus_set_slave(ctx, g_cfg.slave_id);
 
     while (modbus_connect(ctx) < 0) {
         log_write(LOG_WARN, "[Modbus] 串口连接失败，1秒后重试...");
         sleep(1);
     }
-    log_write(LOG_INFO, "[Modbus] 串口连接成功");
+    log_write(LOG_INFO, "[Modbus] 串口连接成功，共%d个设备", g_cfg.device_count);
 
     uint16_t regs[2];
     while (1) {
-        int rc = modbus_read_registers(ctx, 0, 2, regs);
-        if (rc == 2) {
-            char payload[MSG_LEN];
-            snprintf(payload, sizeof(payload),
-                     "{\"temp\":%.1f,\"humidity\":%.1f}",
-                     regs[0] / 10.0f, regs[1] / 10.0f);
-            queue_push(&g_queue, g_cfg.topic, payload);
-            log_write(LOG_INFO, "[Modbus] 采集: %s", payload);
-        } else {
-            log_write(LOG_WARN, "[Modbus] 读取失败，跳过");
+        for (int i = 0; i < g_cfg.device_count; i++) {
+            DeviceConfig *dev = &g_cfg.devices[i];
+            modbus_set_slave(ctx, dev->slave_id);
+
+            int rc = modbus_read_registers(ctx, dev->reg_temp, 2, regs);
+            if (rc == 2) {
+                char payload[MSG_LEN];
+                snprintf(payload, sizeof(payload),
+                         "{\"temp\":%.1f,\"humidity\":%.1f}",
+                         regs[0] / 10.0f, regs[1] / 10.0f);
+                queue_push(&g_queue, dev->topic, payload);
+                log_write(LOG_INFO, "[Modbus] 设备%d 采集: %s",
+                          dev->slave_id, payload);
+            } else {
+                log_write(LOG_WARN, "[Modbus] 设备%d 读取失败，跳过",
+                          dev->slave_id);
+            }
+            sleep(g_cfg.poll_interval);
         }
-        sleep(g_cfg.poll_interval);
     }
     modbus_close(ctx);
     modbus_free(ctx);
@@ -279,12 +319,12 @@ void *publish_thread(void *arg) {
         mqtt_msg.retained   = 0;
 
         MQTTClient_deliveryToken token;
-        int rc = MQTTClient_publishMessage(client, g_cfg.topic,
+        int rc = MQTTClient_publishMessage(client, msg.topic,
                                            &mqtt_msg, &token);
 
         if (rc == MQTTCLIENT_SUCCESS) {
             MQTTClient_waitForCompletion(client, token, 10000L);
-            log_write(LOG_INFO, "[MQTT] 发布: %s", msg.payload);
+            log_write(LOG_INFO, "[MQTT] 发布 [%s]: %s", msg.topic, msg.payload);
         } else {
             db_save(msg.topic, msg.payload);
 
