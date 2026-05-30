@@ -325,7 +325,7 @@ static int db_replay(MQTTClient client) {
 void *collect_thread(void *arg) {
     (void)arg;
     /* 修复：检查 modbus_new_rtu 返回值 */
-    modbus_t *ctx = modbus_new_rtu(g_cfg.serial_port, g_cfg.baudrate, 'N', 8, 1);
+    modbus_t *ctx = modbus_new_rtu(g_cfg.serial_port, g_cfg.baudrate, 'E', 8, 1);
     if (!ctx) {
         log_write(LOG_ERROR, "[Modbus] modbus_new_rtu 失败");
         return NULL;
