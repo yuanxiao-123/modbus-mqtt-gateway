@@ -4,13 +4,13 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <signal.h>
-#include <errno.h>
 #include <modbus/modbus.h>
 #include <MQTTClient.h>
 #include <sqlite3.h>
 #include <ctype.h>
 #include <stdarg.h>
 #include <time.h>
+#include <stdint.h>
 
 /* ─────────────── 运行标志 ─────────────── */
 static volatile sig_atomic_t g_running = 1;
@@ -50,10 +50,12 @@ void log_write(LogLevel level, const char *fmt, ...) {
 #define DEVICE_MAX 8
 
 typedef struct {
-    int  slave_id;
-    int  reg_temp;
-    int  reg_humidity;
-    char topic[128];
+    int      slave_id;
+    int      reg_temp;
+    int      reg_humidity;
+    char     topic[128];
+    uint32_t ok_count;    /* 读取成功次数 */
+    uint32_t fail_count;  /* 读取失败次数 */
 } DeviceConfig;
 
 /* ─────────────── 配置 ─────────────── */
@@ -249,14 +251,19 @@ void db_init(void) {
 
 void db_save(const char *topic, const char *payload) {
     sqlite3_stmt *stmt;
-    sqlite3_prepare_v2(g_db,
-        "INSERT INTO queue (topic, payload) VALUES (?, ?);",
-        -1, &stmt, NULL);
+    if (sqlite3_prepare_v2(g_db,
+            "INSERT INTO queue (topic, payload) VALUES (?, ?);",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        log_write(LOG_ERROR, "[DB] 缓存失败: %s", sqlite3_errmsg(g_db));
+        return;
+    }
     sqlite3_bind_text(stmt, 1, topic,   -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, payload, -1, SQLITE_STATIC);
-    sqlite3_step(stmt);
+    if (sqlite3_step(stmt) != SQLITE_DONE)
+        log_write(LOG_ERROR, "[DB] 写入失败: %s", sqlite3_errmsg(g_db));
+    else
+        log_write(LOG_WARN, "[DB] 缓存: %s", payload);
     sqlite3_finalize(stmt);
-    log_write(LOG_WARN, "[DB] 缓存: %s", payload);
 }
 
 /*
@@ -335,7 +342,8 @@ void *collect_thread(void *arg) {
 
     /* bus_fail 统计整轮全部设备都失败的连续轮次，用于判断串口是否断线。
      * 单台设备失败不影响计数，避免一台在线设备掩盖另一台设备的持续失败。 */
-    int bus_fail = 0;
+    int bus_fail   = 0;
+    int stat_round = 0;   /* 每 60 轮打印一次各设备统计 */
     while (g_running) {
         int cycle_ok = 0;   /* 本轮是否至少有一台设备读取成功 */
 
@@ -349,6 +357,7 @@ void *collect_thread(void *arg) {
 
             if (rc1 == 1 && rc2 == 1) {
                 cycle_ok = 1;
+                dev->ok_count++;
                 char payload[MSG_LEN];
                 snprintf(payload, sizeof(payload),
                          "{\"ts\":%ld,\"temp\":%.1f,\"humidity\":%.1f}",
@@ -356,8 +365,18 @@ void *collect_thread(void *arg) {
                 queue_push(&g_queue, dev->topic, payload);
                 log_write(LOG_INFO, "[Modbus] 设备%d: %s", dev->slave_id, payload);
             } else {
+                dev->fail_count++;
                 log_write(LOG_WARN, "[Modbus] 设备%d 读取失败", dev->slave_id);
             }
+        }
+
+        if (++stat_round >= 60) {
+            stat_round = 0;
+            for (int i = 0; i < g_cfg.device_count; i++)
+                log_write(LOG_INFO, "[STAT] 设备%d: 成功%u次 失败%u次",
+                          g_cfg.devices[i].slave_id,
+                          g_cfg.devices[i].ok_count,
+                          g_cfg.devices[i].fail_count);
         }
 
         /* 只有整轮全部失败才计入总线失败次数并考虑重连 */
@@ -390,6 +409,36 @@ void *collect_thread(void *arg) {
     return NULL;
 }
 
+/* 发布网关在线状态（retained），供订阅方感知存活；重连后调用可覆盖 LWT 的 offline */
+static void publish_online_status(MQTTClient client) {
+    MQTTClient_message om = MQTTClient_message_initializer;
+    om.payload    = "online";
+    om.payloadlen = 6;
+    om.qos        = 1;
+    om.retained   = 1;
+    MQTTClient_deliveryToken tok;
+    MQTTClient_publishMessage(client, "gateway/status", &om, &tok);
+    MQTTClient_waitForCompletion(client, tok, 3000L);
+}
+
+/* 校验配置合法性，将非法值重置为安全默认值 */
+static void config_validate(void) {
+    if (g_cfg.poll_interval <= 0) {
+        log_write(LOG_WARN, "[CFG] poll_interval=%d 无效，重置为1", g_cfg.poll_interval);
+        g_cfg.poll_interval = 1;
+    }
+    if (g_cfg.baudrate <= 0) {
+        log_write(LOG_WARN, "[CFG] baudrate=%d 无效，重置为9600", g_cfg.baudrate);
+        g_cfg.baudrate = 9600;
+    }
+    if (g_cfg.qos < 0 || g_cfg.qos > 2) {
+        log_write(LOG_WARN, "[CFG] qos=%d 无效，重置为1", g_cfg.qos);
+        g_cfg.qos = 1;
+    }
+    if (g_cfg.device_count == 0)
+        log_write(LOG_WARN, "[CFG] 未配置任何设备");
+}
+
 /* ─────────────── 发布线程 ─────────────── */
 void *publish_thread(void *arg) {
     (void)arg;
@@ -407,8 +456,11 @@ void *publish_thread(void *arg) {
     will.retained  = 1;
     opts.will      = &will;
 
-    MQTTClient_create(&client, g_cfg.broker, g_cfg.client_id,
-                      MQTTCLIENT_PERSISTENCE_NONE, NULL);
+    if (MQTTClient_create(&client, g_cfg.broker, g_cfg.client_id,
+                          MQTTCLIENT_PERSISTENCE_NONE, NULL) != MQTTCLIENT_SUCCESS) {
+        log_write(LOG_ERROR, "[MQTT] MQTTClient_create 失败");
+        return NULL;
+    }
 
     while (g_running && MQTTClient_connect(client, &opts) != MQTTCLIENT_SUCCESS) {
         log_write(LOG_WARN, "[MQTT] 连接失败，1秒后重试...");
@@ -417,18 +469,7 @@ void *publish_thread(void *arg) {
     if (!g_running) { MQTTClient_destroy(&client); return NULL; }
     log_write(LOG_INFO, "[MQTT] 连接Broker成功");
 
-    /* 发布在线状态（retained），供订阅方感知网关存活 */
-    {
-        MQTTClient_message om = MQTTClient_message_initializer;
-        om.payload    = "online";
-        om.payloadlen = 6;
-        om.qos        = 1;
-        om.retained   = 1;
-        MQTTClient_deliveryToken tok;
-        MQTTClient_publishMessage(client, "gateway/status", &om, &tok);
-        MQTTClient_waitForCompletion(client, tok, 3000L);
-    }
-
+    publish_online_status(client);
     db_replay(client);
 
     Message msg;
@@ -443,14 +484,25 @@ void *publish_thread(void *arg) {
 
         MQTTClient_deliveryToken token;
         int rc = MQTTClient_publishMessage(client, msg.topic, &mqtt_msg, &token);
+        int need_reconnect = 0;
 
         if (rc == MQTTCLIENT_SUCCESS) {
-            MQTTClient_waitForCompletion(client, token, 10000L);
-            log_write(LOG_INFO, "[MQTT] 发布 [%s]: %s", msg.topic, msg.payload);
+            /* 修复：检查 waitForCompletion，超时视为投递失败，缓存重发 */
+            if (MQTTClient_waitForCompletion(client, token, 10000L) == MQTTCLIENT_SUCCESS) {
+                log_write(LOG_INFO, "[MQTT] 发布 [%s]: %s", msg.topic, msg.payload);
+            } else {
+                log_write(LOG_WARN, "[MQTT] 发布确认超时，缓存重发: %s", msg.topic);
+                db_save(msg.topic, msg.payload);
+                need_reconnect = 1;
+            }
         } else {
             db_save(msg.topic, msg.payload);
-            /* 修复：先 disconnect 再 connect，否则 paho 返回 MQTTCLIENT_CONNECTED
-             * 导致 while 循环永远无法退出 */
+            need_reconnect = 1;
+        }
+
+        if (need_reconnect) {
+            /* 先 disconnect 再 connect，避免 paho 返回 MQTTCLIENT_CONNECTED
+             * 导致重连循环无法退出 */
             MQTTClient_disconnect(client, 0);
             while (g_running && MQTTClient_connect(client, &opts) != MQTTCLIENT_SUCCESS) {
                 log_write(LOG_WARN, "[MQTT] 重连中...");
@@ -458,15 +510,7 @@ void *publish_thread(void *arg) {
             }
             if (g_running) {
                 log_write(LOG_INFO, "[MQTT] 重连成功");
-                /* 重连后重新发布在线状态，覆盖 LWT 留下的 offline */
-                MQTTClient_message om = MQTTClient_message_initializer;
-                om.payload    = "online";
-                om.payloadlen = 6;
-                om.qos        = 1;
-                om.retained   = 1;
-                MQTTClient_deliveryToken tok;
-                MQTTClient_publishMessage(client, "gateway/status", &om, &tok);
-                MQTTClient_waitForCompletion(client, tok, 3000L);
+                publish_online_status(client);
                 db_replay(client);
             }
         }
@@ -493,6 +537,7 @@ int main(void) {
     log_write(LOG_INFO, "=== Modbus->MQTT 网关启动 ===");
 
     config_load("gateway.conf");
+    config_validate();
     db_init();
     queue_init(&g_queue);
 
